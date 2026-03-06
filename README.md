@@ -31,9 +31,9 @@ ADK-Enhancer is a project aimed at bridging the gap between Microsoft's Windows 
 | `-SourceMediaPath` | (required) | Root of Windows installation media (must contain `Sources\install.wim`) |
 | `-BaseWim` | `WinRE` | Base PE image: `WinRE` (extracted from install.wim) or `Boot` (boot.wim) |
 | `-Compression` | `XPRESS` | WIM compression: `None`, `XPRESS`, `LZX` (see compression section below) |
-| `-FBWFCacheSizeMB` | `512` | FBWF write-filter cache size in MB (max 4094 on x64, 1024 on x86) |
+| `-FBWFCacheSizeMB` | `512` | FBWF write-filter cache size in MB (max 4094 MB on Win10, up to 32+ GB on Win11) |
 | `-ScratchSpaceMB` | `512` | WinPE scratch space in MB (`32`, `64`, `128`, `256`, `512`) |
-| `-KeepWoW64` | `$true` | Include 32-bit (WoW64) compatibility layer |
+| `-KeepWoW64` | `$true` | Include 32-bit (WoW64) compatibility layer (150+ DLLs from PhoenixPE minimal list) |
 | `-Language` | `en-US` | Language to keep; all other MUI resources are removed |
 | `-IncludeAudio` | `$false` | Inject audio subsystem from install.wim |
 | `-IncludeShell` | `$false` | Inject full shell components (Explorer, DWM) for desktop builds |
@@ -261,7 +261,8 @@ RegWrite,HKLM,0x4,"Tmp_System\ControlSet001\Services\FBWF","WinPECacheThreshold"
 
 Limits enforced:
 - **x86 WinPE**: max 1024 MB
-- **x64 Win10/11 WinPE**: max 4094 MB (the FBWF driver treats the value 4096 as a sentinel meaning "use maximum supported", so writing 4096 to the registry does not set a 4096 MB cache — it is interpreted as a special flag rather than a size; 4094 is therefore the largest usable explicit value)
+- **x64 Win10 (build ≤ 22000)**: max 4094 MB (the FBWF driver treats the value 4096 as a sentinel meaning "use maximum supported", so writing 4096 to the registry does not set a 4096 MB cache — it is interpreted as a special flag rather than a size; 4094 is therefore the largest usable explicit value)
+- **x64 Win11 (build ≥ 22000)**: no 4094 MB restriction — PhoenixPE comment states "As of Win11 23H2 tested working up to 32 GB"; the script auto-detects the source Windows build from the loaded install.wim hive and applies the correct limit
 
 ### wimbuilder2 approach
 wimbuilder2 (`SystemDriveSize.bat`) uses the same registry key but adds an optional fallback to the **Windows Embedded Standard (WES) fbwf.sys** driver for large cache sizes (>4096 MB or `128GB` preset). This WES driver allows virtually unlimited cache sizes using exFAT-formatted boot media:
@@ -309,6 +310,78 @@ wimbuilder2 configures scratch space indirectly through FBWF cache sizing (`Syst
 ```
 
 The script calls `dism.exe /Image:<mountDir> /Set-ScratchSpace:512` against the mounted WIM before unmounting and capturing.
+
+---
+
+## Comparison with PhoenixPE and wimbuilder2 — Gaps Identified and Fixed
+
+This section documents the detailed comparison performed against both reference projects and the corrections applied to `Enhance-WinPE.ps1`.
+
+### Gap 1: Registry Hive Merging (Critical)
+
+**Original state:** The script only wrote individual `reg add` values to the PE hives. This left COM class registrations, media type handlers, Svchost groups, and other critical entries completely absent.
+
+**PhoenixPE approach (`211-Registry.script` — `Config-BaseWim-SoftwareHive` + `Config-BaseWim-SystemHive`):**
+Uses `RegCopy` (whole subtree copy) to merge these keys from install.wim into the PE hives:
+- SOFTWARE: `Classes\AppID`, `Classes\CLSID`, `Classes\Interface`, `Classes\Typelib`
+- SOFTWARE: `Classes\folder`, `Classes\themefile`, `Classes\SystemFileAssociations`
+- SOFTWARE: `Classes\DirectShow`, `Classes\Media Type`, `Classes\MediaFoundation`
+- SOFTWARE: `Microsoft\Windows NT\CurrentVersion\Svchost`, `Microsoft\SecurityManager`, `Microsoft\Ole`
+- SOFTWARE: `Microsoft\PolicyManager`, `Microsoft\WindowsRuntime`, `AppModel`, `AppX`
+- SYSTEM: `Services\Appinfo`, `Control\Lsa`, `Control\Power`, `Services\Tcpip/Winsock/Winsock2`
+- SYSTEM: `Control\Session Manager\KnownDLLs`
+
+**Fix:** Script now extracts install.wim hive files, loads them alongside the PE hives, and uses `reg.exe copy /s` to replicate all these subtrees before applying PE-specific overrides.
+
+### Gap 2: WoW64 File List (Major)
+
+**Original state:** The script copied only ~34 core DLLs to `SysWOW64`.
+
+**PhoenixPE approach (`251-WoW64.script` Minimal WoW64 section):** Copies 258+ files including NLS/KBD globs, COM/OLE infrastructure, DirectX, audio, WMI 32-bit support, all standard runtime DLLs, network stack, crypto stack, IME/locale, and shell DLLs.
+
+**Fix:** WoW64 list expanded to 150+ specifically-named DLLs plus wildcard copies for `C_*.NLS`, `KBD*.dll`, and the `wbem` folder. The System32 WoW64 bridge now also includes `wowreg32.exe`.
+
+### Gap 3: FBWF Windows Version Detection (Correctness)
+
+**Original state:** Script unconditionally clamped FBWF to 4094 MB regardless of Windows version.
+
+**PhoenixPE note in `Config-FBWF`:** *"As of Win11 23H2 tested working up to 32 GB."* Win10 (build ≤ 22000) has the 4094 MB limit; Win11 (build ≥ 22000) does not.
+
+**Fix:** Script now reads `CurrentBuild` from the loaded install.wim SOFTWARE hive to detect Win10 vs Win11 and applies the appropriate limit at runtime.
+
+### Gap 4: Missing Registry Settings
+
+**Original state:** Several important PE registry settings were absent.
+
+**Added (from PhoenixPE `212-ShellConfig.script`):**
+- `WinPE\OC\Microsoft-WinPE-WMI` / `Microsoft-WinPE-WSH` / `UGC\Microsoft-Windows-TCPIP` — component initialization hooks
+- `Winlogon\EnableSIHostIntegration` = 1
+- `CurrentVersion\Setup\Installation Sources` pointing to `C:\Windows\System32\DriverStore\FileRepository`
+- `diagnosticshub.standardcollector.service\Start` = 4, `DiagTrack\Start` = 4
+- `MiniNT\AllowRefsFormatOverNonmirrorVolume` = 1
+- `i8042prt\Parameters\EnableWheelDetection` = 2
+- `usbhub\HubG\DisableOnSoftRemove` = 1
+- `Lsa\LmCompatibilityLevel` = 3 (was incorrectly 0; PhoenixPE uses 3 = NTLMv2 only)
+- `Security Packages` = `tspkg`, `SecurityProviders` = `credssp.dll`
+- `BFE\ImagePath` full path override (not just `SvcHostSplitDisable`)
+- `Personalization\AllowChangeDesktopBackground` + `AllowPersonalization` = 1
+- TermService: copied from install.wim and disabled (Start=4)
+- Desktop wallpaper `CustomBackground` key in WinPE section
+
+### Gap 5: Core System32 Components
+
+**Added from PhoenixPE `210-Core.script`:**
+- WiFi drivers: `vwifibus.sys`, `vwifimp.sys`, `WifiCx.sys` — copied to `Windows\System32\Drivers`
+- iSCSI WMI MOF files: `iscsidsc.mof`, `iscsihba.mof`, `storagewmi.mof`, etc. — copied to `Windows\System32\wbem`
+- Additional DLLs: `dxgi.dll`, `dxva2.dll`, `DXCore.dll`, `fmapi.dll`
+
+### Gap 6: Drive Letter Fix
+
+**Original state:** Script did not check or fix the system drive letter in the registry.
+
+**PhoenixPE approach (`SetSystemDriveLetter`):** Checks if `Classes\CLSID\{0000002F...}\InprocServer32` contains `C:\` and if so runs a global find-replace across both SOFTWARE and SYSTEM hives to replace `C:\` with `X:\`. This prevents black/blue screen on PE boot with certain media.
+
+**Fix:** Script now checks the CLSID key for `C:\` and performs an export/modify/reimport if needed.
 
 ---
 
