@@ -2,7 +2,44 @@
 
 ## Overview
 
-ADK-Enhancer is a project aimed at bridging the gap between Microsoft's Windows Assessment and Deployment Kit (ADK) WinPE and the richer WinPE environments achievable using full Windows installation media. This repository documents research into why mature WinPE build systems prefer full installation media and outlines how the ADK-based approach can be enhanced.
+ADK-Enhancer is a project aimed at bridging the gap between Microsoft's Windows Assessment and Deployment Kit (ADK) WinPE and the richer WinPE environments achievable using full Windows installation media. This repository documents research into why mature WinPE build systems prefer full installation media and provides a PowerShell script that implements these enhancements.
+
+## Quick Start
+
+### Prerequisites
+- Windows 10/11 host (must run as Administrator)
+- [Windows ADK](https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install) with Deployment Tools installed (`dism.exe`, `oscdimg.exe`)
+- Full Windows 10 or 11 installation media (ISO mounted or extracted; must contain `Sources\install.wim`)
+
+### Basic Usage
+
+```powershell
+# Enhance using WinRE base with XPRESS compression, default FBWF (512 MB), default scratch space (512 MB)
+.\Enhance-WinPE.ps1 -SourceMediaPath "D:\" -OutputWim "C:\Output\boot.wim"
+
+# Full build with LZX compression, larger FBWF cache, and ISO output
+.\Enhance-WinPE.ps1 -SourceMediaPath "D:\" -BaseWim Boot -Compression LZX `
+    -FBWFCacheSizeMB 2048 -ScratchSpaceMB 512 `
+    -IncludeAudio $true -IncludeShell $true `
+    -OutputWim "C:\Output\boot.wim" -OutputIso "C:\Output\WinPE-Enhanced.iso"
+```
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-SourceMediaPath` | (required) | Root of Windows installation media (must contain `Sources\install.wim`) |
+| `-BaseWim` | `WinRE` | Base PE image: `WinRE` (extracted from install.wim) or `Boot` (boot.wim) |
+| `-Compression` | `XPRESS` | WIM compression: `None`, `XPRESS`, `LZX` (see compression section below) |
+| `-FBWFCacheSizeMB` | `512` | FBWF write-filter cache size in MB (max 4094 on x64, 1024 on x86) |
+| `-ScratchSpaceMB` | `512` | WinPE scratch space in MB (`32`, `64`, `128`, `256`, `512`) |
+| `-KeepWoW64` | `$true` | Include 32-bit (WoW64) compatibility layer |
+| `-Language` | `en-US` | Language to keep; all other MUI resources are removed |
+| `-IncludeAudio` | `$false` | Inject audio subsystem from install.wim |
+| `-IncludeShell` | `$false` | Inject full shell components (Explorer, DWM) for desktop builds |
+| `-OutputIso` | (none) | If specified, creates a bootable ISO using oscdimg |
+
+---
 
 ---
 
@@ -177,6 +214,101 @@ Based on this research, an ADK-Enhancer should address the following gaps to all
 4. **Version alignment**: Ensure that the ADK tools (DISM, oscdimg) version matches the Windows build used as the source to prevent compatibility issues.
 
 5. **WoW64 support**: Add a workflow to include the `SysWOW64` layer from `install.wim` for 32-bit application compatibility.
+
+All five of these are implemented in [`Enhance-WinPE.ps1`](Enhance-WinPE.ps1).
+
+---
+
+## Output Image Compression
+
+Both reference projects were analyzed for their compression strategy. The results inform `Enhance-WinPE.ps1`'s `-Compression` parameter:
+
+### PhoenixPE approach
+PhoenixPE (`750-CaptureWim.script`) uses PEBakery's `WimCapture` with a user-selectable compression, defaulting to **XPRESS**. After capture, `WimOptimize` (re-compression) is available as an optional step. The `BOOT` flag is always set, marking the WIM as bootable.
+
+```
+WimCapture,%TargetDir%,%TargetBootWim%,XPRESS,Flags=9,BOOT
+```
+
+> ⚠️ **LZMS is explicitly excluded** from the compression list because it uses solid (streaming) compression, which prevents the WIM from being mounted — a hard requirement for a bootable WIM.
+
+### wimbuilder2 approach
+wimbuilder2 (`za-Slim/SlimWim.bat`) uses **wimlib-imagex** to slim the source WIM *before* mounting (removing MUI language folders, WoW64 if not needed, etc.) to reduce mount time and final image size. The final export uses DISM's `/Export-Image`.
+
+### Compression comparison
+
+| Mode | DISM flag | Typical size | Build time | Notes |
+|------|-----------|-------------|------------|-------|
+| `None` | `none` | Largest | Fastest | Use only for testing |
+| `XPRESS` | `fast` | ~20-30% smaller than None | Fast | **Recommended default** |
+| `LZX` | `maximum` | ~15-25% smaller than XPRESS | Slow | Best for distribution |
+| LZMS | *(unsupported)* | Smallest | Very slow | ❌ Cannot be used for bootable WIMs |
+
+`Enhance-WinPE.ps1` uses DISM `/Export-Image` with the appropriate flag, which also performs an implicit `WimOptimize` (removes orphaned resources from the WIM).
+
+---
+
+## FBWF (File-Based Write Filter)
+
+WinPE boots from a read-only compressed WIM. Without a write filter, any attempt to write to `C:\` (the boot drive) would fail silently or with errors. The **FBWF** provides a RAM-backed overlay that makes the boot drive appear writable.
+
+### PhoenixPE approach
+PhoenixPE configures FBWF via a dedicated `Config-FBWF` section in `212-ShellConfig.script`:
+
+```
+RegWrite,HKLM,0x4,"Tmp_System\ControlSet001\Services\FBWF","WinPECacheThreshold",<SizeMB>
+```
+
+Limits enforced:
+- **x86 WinPE**: max 1024 MB
+- **x64 Win10/11 WinPE**: max 4094 MB (the FBWF driver treats the value 4096 as a sentinel meaning "use maximum supported", so writing 4096 to the registry does not set a 4096 MB cache — it is interpreted as a special flag rather than a size; 4094 is therefore the largest usable explicit value)
+
+### wimbuilder2 approach
+wimbuilder2 (`SystemDriveSize.bat`) uses the same registry key but adds an optional fallback to the **Windows Embedded Standard (WES) fbwf.sys** driver for large cache sizes (>4096 MB or `128GB` preset). This WES driver allows virtually unlimited cache sizes using exFAT-formatted boot media:
+
+```bat
+if exist fbwf_%_fbwf_size%.cfg (
+  copy /y fbwf_%_fbwf_size%.cfg "%X_WIN%\fbwf.cfg"
+  copy /y fbwf.sys "%X_SYS%\drivers\fbwf.sys"
+  reg add HKLM\...\Services\exfat /v Start /t REG_DWORD /d 0 /f
+)
+```
+
+### Implementation in Enhance-WinPE.ps1
+```powershell
+# Registry key: HKLM\SYSTEM\ControlSet001\Services\FBWF\WinPECacheThreshold
+# x64 max: 4094 MB; x86 max: 1024 MB
+.\Enhance-WinPE.ps1 -SourceMediaPath D:\ -FBWFCacheSizeMB 2048 -OutputWim C:\boot.wim
+```
+
+---
+
+## Scratch Space
+
+WinPE scratch space is a **separate** RAM allocation from FBWF. It is used by `dism.exe` and Windows Setup for temporary file operations during PE session.
+
+### FBWF cache vs. Scratch space
+
+| | FBWF cache | Scratch space |
+|---|---|---|
+| Purpose | Writable overlay on boot media (C:\\) | Temp RAM for DISM/Setup |
+| Set by | Registry: `Services\FBWF\WinPECacheThreshold` | `dism.exe /Set-ScratchSpace` |
+| Typical size | 512–2048 MB | 32–512 MB |
+| Location | RAM overlay over C:\ | X:\Windows\Temp (RAM disk) |
+
+### PhoenixPE approach
+PhoenixPE calls DISM `/Set-ScratchSpace` as part of the pre-flight process. It also warns that DISM has issues with network paths and RAM disks (`ERROR_NOT_A_REPARSE_POINT 0x80071126`), which is why PhoenixPE ships its own DISM copy.
+
+### wimbuilder2 approach
+wimbuilder2 configures scratch space indirectly through FBWF cache sizing (`SystemDriveSize.bat`) — a larger FBWF cache gives DISM more room for temp operations.
+
+### Implementation in Enhance-WinPE.ps1
+```powershell
+# Valid values: 32, 64, 128, 256, 512 MB
+.\Enhance-WinPE.ps1 -SourceMediaPath D:\ -ScratchSpaceMB 512 -OutputWim C:\boot.wim
+```
+
+The script calls `dism.exe /Image:<mountDir> /Set-ScratchSpace:512` against the mounted WIM before unmounting and capturing.
 
 ---
 
