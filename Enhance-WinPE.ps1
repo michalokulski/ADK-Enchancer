@@ -558,15 +558,15 @@ if ($KeepWoW64) {
         'ColorAdapterClient.dll', 'DataExchange.dll', 'CoreUIComponents.dll',
         'aclui.dll', 'mscories.dll', 'msIso.dll',
         'offreg.dll', 'odbc32.dll', 'odbcint.dll',
-        'clusapi.dll', 'resutils.dll',
+        'clusapi.dll',
         'wimgapi.dll', 'davhlpr.dll', 'dlnashext.dll',
-        'cscapi.dll', 'directmanipulation.dll', 'edputil.dll',
+        'cscapi.dll', 'directmanipulation.dll',
         'rmclient.dll', 'mmcbase.dll',
         'framedynos.dll', 'ncobjapi.dll', 'wmiclnt.dll',
         'adsldp.dll', 'adsldpc.dll', 'activeds.dll', 'ntdsapi.dll',
         'wldap32.dll', 'dsrole.dll',
         'spfileq.dll', 'SPInf.dll', 'dsound.dll', 'wow32.dll', 'winsta.dll',
-        'fwpuclnt.dll', 'wtsapi32.dll',
+        'wtsapi32.dll',
         # WMI support in 32-bit
         'wbemcomn.dll'
     )
